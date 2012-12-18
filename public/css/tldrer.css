@@ -1,0 +1,137 @@
+label {
+  font-weight: bold;
+}
+
+label.checkbox {
+  font-weight: normal;
+}
+
+input {
+  max-width: 100%;
+}
+
+p {
+  font-family: 'Quando', serif;
+}
+
+.navbar .nav > li > a.active {
+  color: #FFF;
+}
+
+.navbar-inverse .brand {
+  font-family: 'Bad Script', cursive;
+  color: #FFF !important;
+  font-weight: bold !important;
+}
+
+.messages li {
+  margin-left: 1em;
+}
+
+.votes {
+  position: absolute;
+  left: -20px;
+}
+
+.tldr-details,
+.story-details {
+  color: #999;
+  font-size: 95%;
+}
+
+.tldr-details a,
+.story-details a {
+  color: #4BF;
+}
+
+.tldr-content p {
+}
+
+.story-link {
+  margin-bottom: 0;
+}
+
+.story-link a {
+  font-family: "Helvetica Neue",Helvetica,Arial,sans-serif;
+  font-size: 14px;
+}
+
+.story-domain {
+  color: #999;
+  font-style: italic;
+  font-size: 12px;
+}
+
+.story-details-full {
+  margin-bottom: 2em;
+  position: relative;
+}
+
+.story-info .story-tldr {
+  margin-bottom: 0;
+}
+
+.story-tldr > div {
+  margin-top: 1em;
+  margin-bottom: 1em;
+  position: relative;
+}
+
+
+.story-tldr-top > div {
+  background: #CFC;
+  padding: 1em;
+}
+
+.add-post form #title,
+.add-tldr-form form #tldr {
+  width: 75%;
+}
+
+.add-post form #url {
+  width: 52%;
+  margin-right: 2%;
+}
+
+.add-tldr-form form .form-actions {
+  border: none;
+  padding: 0;
+  background: none;
+  margin-top: 0;
+}
+
+footer > .container {
+  margin-top: 4em;
+  padding-top: 2em;
+  border-top: 1px solid #CCC;
+  color: #999;
+}
+
+#aboutmyself {
+  width: 95%;
+}
+
+.request-invite-actions {
+  background: none;
+  border: none;
+  padding: 4px 0 0;
+}
+
+.request-hn-actions {
+  background: none;
+  border: none;
+  padding: 0;
+}
+
+.registration-section {
+  margin-top: 2em;
+  margin-bottom: 2em;
+}
+
+.vote-yay {
+  color: green;
+}
+
+.vote-nay {
+  color: red;
+}

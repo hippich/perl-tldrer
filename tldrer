@@ -1,0 +1,1314 @@
+#!/usr/bin/env perl
+use Mojolicious::Lite;
+
+use lib 'lib';
+use TLDR::Form::RequestInvite;
+use TLDR::Form::ReqHN;
+use TLDR::Form::RegHN;
+use TLDR::Form::RegCode;
+use TLDR::Form::ForgotPassword;
+use TLDR::Form::Add;
+use TLDR::Form::AddTLDR;
+use TLDR::Form::Login;
+use TLDR::Form::Register;
+use TLDR::Form::User::Edit;
+use TLDR::Form::Admin::AddInvite;
+use TLDR::Model;
+
+use DateTime;
+use DateTime::Format::Human::Duration;
+use Digest::MD5 qw(md5_hex);
+use String::Random;
+use Mojo::URL;
+use Net::Twitter;
+use Switch;
+use HTML::FormatText::WithLinks;
+use Data::Validate::URI qw(is_web_uri);
+use Text::Markdown qw/markdown/;
+use HTML::Escape qw/escape_html/;
+
+use Data::Dumper;
+
+plugin 'Sugar';
+plugin 'Bcrypt';
+plugin 'mail';
+plugin 'proxy';
+plugin 'JSONP' => callback => 'callback';
+
+app->attr( m  => sub { return TLDR::Model->new( host => 'localhost', port => 6379) } );
+app->attr( ua => sub { return Mojo::UserAgent->new } );
+app->attr( 
+  tw => sub { 
+    return Net::Twitter->new(
+      traits          => [qw/API::REST OAuth/],
+      consumer_key    => 'xxxxxxxxxxxxxxxxxxxx',
+      consumer_secret => 'xxxxxxxxxxxxxxxxxxxx',
+    );
+  },
+);
+app->attr( apihost => 'api.hntldr.com' );
+app->attr( formatter => sub { return HTML::FormatText::WithLinks->new( leftmargin => 0, rightmargin => 80, skip_linked_urls => 1 ) } );
+app->attr( scrubber => sub { return HTML::Scrubber->new() } );
+
+helper 'timeago' => sub {
+  my ($self, $timestamp) = @_;
+  my $span = DateTime::Format::Human::Duration->new();
+  my $dt = DateTime->from_epoch( epoch => $timestamp );
+  my $precision  = 'days';
+
+  switch (time() - $timestamp) {
+    case { $_[0] < 60 } { $precision = 'seconds'; }
+    case { $_[0] < 3600 } { $precision = 'minutes'; }
+    case { $_[0] < 24*3600 } { $precision = 'hours'; }
+  }
+  return $span->format_duration( DateTime->now() - $dt, precision => $precision);
+};
+
+helper 'domain' => sub {
+  my $url = Mojo::URL->new($_[1]);
+  return $url->host;
+};
+
+
+helper twitter_process => sub {
+  my $self = shift;
+  my $user = $self->app->m->get_user( $self->session('username') ) or return;
+
+  if (!$user->{twitter} || !$user->{twitter}->{access_token}) {
+
+    my $cb_url = $self->req->url->clone;
+    $cb_url->path('/twitter/oauth_callback');
+
+    my $auth_url = $self->app->tw->get_authorization_url(callback => $cb_url->to_abs . $self->req->url->path);
+    $user->{twitter}->{token} = $self->app->tw->request_token;
+    $user->{twitter}->{token_secret} = $self->app->tw->request_token_secret;
+    $self->redirect_to( $auth_url );
+
+    return;
+  }
+
+  my $tw = $self->app->tw;
+
+  $tw->access_token( $user->{twitter}->{access_token} );
+  $tw->access_token_secret( $user->{twitter}->{access_token_secret} );
+
+  foreach my $post ( @{ $self->session('twitter_posts') } ) {
+    eval {
+      $tw->update({ status => $post });
+    };
+
+    if ($@) {
+      my ($msg) = $@->error =~ /(^.+) at tldrer/;
+      $self->flash_add_to( messages => 'Twitter error: '. $msg );
+    }
+
+  }
+
+  delete $self->session->{twitter_posts};
+};
+
+helper 'md' => sub { return markdown($_[1]) };
+
+get '/twitter/oauth_callback/*dest' => { dest => '' } => sub {
+  my $self = shift;
+  my $token = $self->param('oauth_token');
+  my $verifier = $self->param('oauth_verifier');
+  my $user = $self->app->m->get_user( $self->session('username') );
+
+  if ( $user->{twitter}->{token} ne $token ) {
+    delete $user->{twitter};
+    $self->flash_add_to( messages => 'Twitter authentication failed.' );
+  } 
+  else {
+    $self->app->tw->request_token( $token );
+    $self->app->tw->request_token_secret( $user->{twitter}->{token_secret} );
+
+    my @access_tokens = $self->app->tw->request_access_token( verifier => $verifier );
+    $user->{twitter}->{access_token}        = $access_tokens[0];
+    $user->{twitter}->{access_token_secret} = $access_tokens[1];
+  }
+
+  $self->redirect_to('/'. $self->param('dest'));
+};
+
+under '/hnapi' => sub {
+  my $self = shift;
+
+  if ($self->req->url->base->host eq $self->app->apihost) {
+    return 1;
+  }
+
+  return;
+};
+
+post '/post' => sub {
+  my $self      = shift;
+  my $url       = $self->param('url');
+  my $callback  = $self->param('callback') || 'jsonp';
+
+  $self->render_not_found unless $url && $self->app->m->url_exists($url);
+
+  my $story = $self->app->m->story_by_url($url);
+  my @top_tldrs;
+
+  if (ref $story->{tldr} eq 'ARRAY') {  
+    @top_tldrs = (sort { $b->{votes} <=> $a->{votes} } @{$story->{tldr}})[0 .. 2];
+  }
+
+  $self->render_jsonp({
+    sorted_tldrs => \@top_tldrs,
+    hn_tldr      => $story->{hn_tldr},
+    tldr         => $story->{tldr},
+  });
+};
+
+post '/vote' => sub {
+  my $self       = shift;
+  my $url        = $self->param('url');
+  my $url_title  = $self->param('url_title');
+  my $comment    = $self->param('comment');
+  my $username   = lc $self->param('username');
+  my $vote_user  = lc $self->param('vote_user');
+  my $comment_id = $self->param('comment_id');
+  my $ip         = $self->tx->remote_address;
+
+  # Sanitize input 
+  return unless is_web_uri($url);
+
+  $comment = $self->app->formatter->parse($comment);
+
+  $username =~ s/[^a-z0-9\_]+//g;
+  $username = substr($username, 0, 50);
+
+  $vote_user =~ s/[^a-z0-9\_]+//g;
+  $vote_user = substr($vote_user, 0, 50);
+
+  $url_title = $self->app->formatter->parse($url_title);
+  $url_title =~ s/\n/ /g;
+  
+  if (length($url_title) > 80) {
+    $url_title = substr($url_title, 0, 80) . "...";
+  }
+
+  # Add URL if needed and create or vote for existing tl;dr
+  my $story_id = $self->app->m->url_exists($url);
+
+  if (! $story_id) {
+    $story_id = $self->app->m->add_story({
+      votes    => 1,
+      url      => $url,
+      title    => $url_title,
+      username => $username,
+      time     => time(),
+    });
+  }
+
+  my $story = $self->app->m->story($story_id);
+
+  if ( !$story->{hn_tldr} || !$story->{hn_tldr}->{$comment_id} ) {
+    my $tldr = {
+      title    => $comment,
+      username => $username,
+      votes    => 0,
+      time     => time(),
+    };
+
+    my $tldr_id = push @{$story->{tldr}}, $tldr;
+    $story->{hn_tldr}->{$comment_id} = $tldr_id - 1;
+  }
+
+  # Make sure user did not vote already
+  if ($story->{hn_voters} && $story->{hn_voters}->{$vote_user}->{$comment_id}) {
+    $self->render_jsonp({ status => 'already voted' });
+    return;
+  }
+
+  # Make sure user did not vote already
+  if ($story->{hn_voters_ip} && $story->{hn_voters_ip}->{$ip}->{$comment_id}) {
+    $self->render_jsonp({ status => 'already voted' });
+    return;
+  }
+
+  # Get internal tldr id from comment id
+  my $tldr_id = $story->{hn_tldr}->{$comment_id};
+
+  # Recalculate tldrs in story
+  $self->app->m->story_tldr_recalc($story_id, $tldr_id, 1);
+
+  # Get total votes for this tldr
+  my $votes = $story->{tldr}->[$tldr_id]->{votes};
+
+  # Mark this comment voted for by $username and $ip
+  $story->{hn_voters}->{$vote_user}->{$comment_id} = 1;
+  $story->{hn_voters_ip}->{$ip}->{$comment_id} = 1;
+
+  $self->render_jsonp({ status => 'success', votes => $votes });
+};
+
+under '/' => sub {
+  my $self = shift;
+
+  if ($self->req->url->base->host eq $self->app->apihost) {
+    $self->render_not_found;
+    return;
+  }
+
+  if ($self->session('username')) {
+    my $user = $self->app->m->get_user( $self->session('username') );
+    $self->stash( user => $user );
+    $self->session( user => $user );
+
+    # Process any twitter posts from the queue
+    if ($self->session('twitter_posts')) {
+      $self->twitter_process;
+    }
+  }
+
+  return 1;
+};
+
+get '/why' => 'why';
+
+get '/' => sub {
+  my $self = shift;
+  $self->stash( items => [ grep( $_, map { $self->app->m->story($_) } $self->app->m->get_top ) ] );
+} => 'index';
+
+post '/ajax/gettitle' => sub {
+  my $self = shift;
+  my $url = $self->param('url');
+  my $tx = $self->app->ua->get($url);
+
+  if ($tx->res->code == 200) {
+    $self->render(
+      json => {
+        status => 'success',
+        title => $tx->res->dom->at('head title')->text(),
+      },
+    );
+    return;
+  }
+
+  $self->render(
+    json => {
+      status => 'error',
+    },
+  );
+};
+
+get '/register' => sub {
+  my $self = shift;
+  $self->redirect_to('/') if $self->session('username');
+
+  $self->stash(
+    byinvite => TLDR::Form::RequestInvite->new({
+      action => '/request/email',
+    }),
+    byhn => TLDR::Form::ReqHN->new({
+      action => '/register/hn',
+    }),
+  );
+} => 'register';
+
+
+post '/request/email' => sub {
+  my $self = shift;
+
+  my $form = TLDR::Form::RequestInvite->new;
+  $form->process( $self->params->to_hash );
+
+  if ($form->validated) {
+    $self->flash_add_to( messages => 'Your request was successfully sent. You should expect answer soon.' );
+
+    $self->mail(
+      to => 'pavel@karoukin.us',
+      subject => 'new request at tl;dr;',
+      data => 'Email: '. $form->field('email')->value ."\n About: ". $form->field('aboutmyself')->value,
+    );
+
+    $self->redirect_to( '/' ); 
+    return;
+  }
+
+  $self->stash( 
+    title => 'Request Invite',
+    form => $form,
+  );
+} => 'request/email';
+
+post '/register/hn' => sub {
+  my $self = shift;
+  my $form = TLDR::Form::ReqHN->new(
+    hn_username_validate_cb => sub {
+      return !$self->app->m->hn_username_exists(shift);
+    },
+  );
+  $form->process( $self->params->to_hash );
+  
+  if ($form->validated) {
+    $self->stash( register_form => 1 );
+
+    my $code = md5_hex( $self->param('hnuser') );
+
+    $form = TLDR::Form::RegHN->new( 
+      code => $code, 
+      user_exists_cb  => sub { return $self->app->m->get_user( lc shift ); },
+      email_exists_cb => sub { return $self->app->m->get_user_by_email( lc shift ); },
+    );
+
+    $self->stash( code => $code );
+
+    if ($self->param('register') eq 'hn') {
+      $form->process( $self->params->to_hash );
+
+      if ($form->validated) {
+        $self->app->m->add_user({
+            username => lc $form->field('username')->value,
+            password => $self->bcrypt( $form->field('password')->value ),
+            email    => $form->field('email')->value,
+            hnuser   => $form->field('hnuser')->value,
+        });
+
+        $self->app->m->add_hn_username($form->field('hnuser')->value, lc $form->field('username')->value);
+
+        $self->flash_add_to(messages => 'Account created successfully. You can log in now.');
+        $self->redirect_to('/');
+      }
+    }
+    else {
+      $form->field('hnuser')->value( $self->param('hnuser') );
+    }
+  }
+
+  $self->stash( 
+    form => $form,
+  );
+} => 'register/hn';
+
+get '/register/invite' => sub {
+  my $self = shift;
+  $self->redirect_to('/') if $self->session('username');
+  $self->stash( form => TLDR::Form::RegCode->new );
+} => "register/invite";
+
+post '/register/invite' => sub {
+  my $self = shift;
+
+  my $form = TLDR::Form::RegCode->new( 
+    user_exists_cb  => sub { return $self->app->m->get_user( lc shift ); },
+    email_exists_cb => sub { return $self->app->m->get_user_by_email( lc shift ); },
+    code_validate_cb => sub { return $self->app->m->invites->{$_[0]} && !$self->app->m->invites->{$_[0]}->{email} },
+  );
+
+  $form->process( $self->params->to_hash );
+  
+  if ($form->validated) {
+    $self->app->m->add_user({
+        username => lc $form->field('username')->value,
+        password => $self->bcrypt( $form->field('password')->value ),
+        email    => $form->field('email')->value,
+        invite   => $form->field('code')->value,
+    });
+
+    my $invite = $self->app->m->invites->{ $form->field('code')->value };
+    $invite->{email} = $form->field('email')->value;
+    $self->app->m->invites->{ $form->field('code')->value } = $invite;
+
+    $self->flash_add_to(messages => 'Account created successfully. You can log in now.');
+    $self->redirect_to('/');
+    return;
+  }
+
+  $self->stash( 
+    form => $form,
+  );
+} => 'register/invite';
+
+get '/new' => sub {
+  my $self = shift;
+  $self->stash( items => [ map { $self->app->m->story($_) } $self->app->m->get_new ] );
+} => 'new';
+
+get '/story/:story_id' => sub {
+  my $self = shift;
+  my $story_id = $self->param('story_id');
+
+  my $story = $self->app->m->story($story_id);
+
+  $self->render_not_found unless $story;
+
+  $self->stash(
+    story => $story,
+  );
+
+  if ($self->session('username')) {
+    $self->stash( add_tldr => TLDR::Form::AddTLDR->new({ action => '/story/'. $story_id .'/tldr' }) );
+  }
+
+} => 'story';
+
+
+get '/registery' => sub {
+  my $self = shift;
+  $self->stash( form => TLDR::Form::Register->new );
+} => 'register';
+
+
+post '/registery' => sub {
+  my $self = shift;
+
+  my $form = TLDR::Form::Register->new( 
+    user_exists_cb  => sub { return $self->app->m->get_user( lc shift ); },
+    email_exists_cb => sub { return $self->app->m->get_user_by_email( lc shift ); },
+  );
+
+  $form->process( $self->params->to_hash );
+
+  if ($form->validated) {
+    $self->app->m->add_user({
+        username => lc $form->field('username')->value,
+        password => $self->bcrypt( $form->field('password')->value ),
+        email    => $form->field('email')->value,
+    });
+
+    $self->flash_add_to(messages => 'Account created successfully. You can log in now.');
+    $self->redirect_to('/');
+  }
+
+  $self->stash( form => $form );
+} => 'register';
+
+
+get '/forgot' => sub {
+  my $self = shift;
+  $self->stash( title => 'Reset password', form => TLDR::Form::ForgotPassword->new );
+} => 'generic_form';
+
+
+post '/forgot' => sub {
+  my $self = shift;
+
+  my $form = TLDR::Form::ForgotPassword->new(
+    login_validate_cb => sub {
+      return $self->app->m->get_user( lc $_[0] ) || $self->app->m->get_user_by_email( lc $_[0] );
+    },
+  );
+
+  $form->process( $self->params->to_hash );
+
+  if ($form->validated) {
+
+    my $user = $self->app->m->get_user($form->field('login')->value) || $self->app->m->get_user_by_email($form->field('login')->value);
+    my $code = md5_hex(String::Random->new->randpattern('........................'));
+
+    $user->{forgot_code} = $self->bcrypt( $code );
+    $user->{forgot_code_time} = time();
+
+    my $url = $self->req->url->clone;
+    $url->path('/forgot/'. $user->{username} .'/'. $code);
+    my $reset_url =  $url->to_abs;
+
+    $self->mail(
+      to => $user->{email},
+      subject => 'Password reset request',
+      data => 'To reset password open URL: '. $reset_url,
+    );
+
+    $self->flash_add_to( messages => 'You should receive email with one-time use URL to login to website and change password.' );
+    $self->redirect_to('/');
+    return;
+  } 
+
+  $self->stash( title => 'Reset password', form => $form );
+} => 'generic_form';
+
+get '/forgot/:user_id/*code' => sub {
+  my $self = shift;
+  my $user = $self->app->m->get_user( $self->param('user_id') );
+
+  $self->render_not_found unless $user;
+
+  if ($user->{forgot_code_time} + 3600 < time()) {
+    $self->flash_add_to( messages => 'This reset link expired. Please request new reset link.' );
+    $self->redirect_to('/forgot');
+    return;
+  }
+
+  if ($self->bcrypt_validate( $self->param('code'), $user->{forgot_code} )) {
+    $self->session('username' => $self->param('user_id'));
+    $self->flash_add_to( messages => 'You are logged in using one time sign in link. Please update your password' );
+    $user->{forgot_code} = '';
+
+    # Add a session note to allow to change password without confirming old one
+    $self->session( forgot_password => 1 );
+
+    $self->redirect_to('/user/'. $self->param('user_id') .'/edit');
+    return;
+  }
+
+  $self->render_not_found;
+};
+
+
+get '/user/:user_id' => sub {
+  my $self = shift;
+  $self->stash( user => $self->app->m->get_user( $self->param('user_id') ) || $self->render_not_found );
+} => 'user';
+
+get '/login' => sub {
+  my $self = shift;
+  $self->stash( form => TLDR::Form::Login->new );
+} => 'login';
+
+
+post '/login' => sub {
+  my $self = shift;
+
+  my $form = TLDR::Form::Login->new(
+    user_validate_cb => sub {
+      my ($username, $password) = @_;
+      my $user = $self->app->m->get_user($username) || $self->app->m->get_user_by_email($username) or return;
+      return $self->bcrypt_validate( $password, $user->{password} );
+    },
+  );
+
+  $form->process( $self->params->to_hash );
+
+  if ($form->validated) {
+    my $user = $self->app->m->get_user( $form->field('username')->value ) || $self->app->m->get_user_by_email( $form->field('username')->value );
+    $self->session(expiration => 365 * 24 * 3600);
+    $self->session( username => $user->{username} );
+    $self->flash_add_to( messages => 'You are logged in.' );
+
+    if ($self->param('redirect_to')) {
+      $self->redirect_to($self->param('redirect_to'));
+    } 
+    else {
+      $self->redirect_to('/');
+    }
+  }
+
+  $self->stash( form => $form );
+} => 'login';
+
+
+under '/' => sub {
+  my $self = shift;
+
+  if ($self->session('username')) {
+    my $user = $self->app->m->get_user( $self->session('username') );
+    $self->stash( user => $user );
+    $self->session( user => $user );
+
+    # Process any twitter posts from the queue
+    if ($self->session('twitter_posts')) {
+      $self->twitter_process;
+    }
+  }
+
+  return 1 unless !$self->session('username');
+
+  $self->flash_add_to( messages => 'Please log in.' );
+  $self->redirect_to('/login?redirect_to='. $self->req->url->path);
+
+  return;
+};
+
+
+get '/user/:user_id/edit' => sub {
+  my $self = shift;
+  
+  if ($self->session('username') ne $self->param('user_id') && !$self->session('user')->{admin}) {
+    $self->render_not_found;
+    return;
+  }
+
+  my $user = $self->app->m->get_user( $self->param('user_id') );
+
+  my $form = TLDR::Form::User::Edit->new;
+
+  $form->process( init_object => {
+    email => $user->{email},
+    aboutyou => $user->{about},
+  });
+
+  $form->process( inactive => ['old_password'] ) if $self->session('forgot_password');
+
+  $self->stash( form => $form );
+  
+} => 'user/edit';
+
+
+post '/user/:user_id/edit' => sub {
+  my $self = shift;
+  
+  if ($self->session('username') ne $self->param('user_id') && !$self->session('user')->{admin}) {
+    $self->render_not_found;
+    return;
+  }
+
+  my $user = $self->app->m->get_user($self->param('user_id'));
+
+  my $form = TLDR::Form::User::Edit->new(
+    email_exists_cb => sub {
+      return $user->{email} ne $_[0] && $self->app->m->get_user_by_email( lc $_[0] );
+    },
+    pass_validate_cb => sub {
+      return 
+           $self->bcrypt_validate( shift, $user->{password} ) 
+        || $self->session('user')->{admin} 
+        || $self->session('forgot_password');
+    },
+  );
+
+  if ( $self->session('forgot_password') ) {
+    $form->process( 
+      params => $self->params->to_hash, 
+      inactive => ['old_password'] 
+    );
+  } 
+  else {
+    $form->process( $self->params->to_hash );
+  }
+
+  if ( $form->validated ) {
+
+    if ($form->field('password')->value) {
+      $user->{password} = $self->bcrypt( $form->field('password')->value );
+    }
+
+    $user->{email}    = $form->field('email')->value;
+    $user->{about}    = $form->field('aboutyou')->value;
+
+    # Reset session note for forgot password function
+    $self->session('forgot_password' => 0);
+
+    $self->flash_add_to( messages => "Profile updated" );
+    $self->redirect_to( '/user/'. $self->param('user_id') );
+    return;
+  }
+
+  $self->stash( form => $form );
+} => 'user/edit';
+
+
+get '/logout' => sub {
+  my $self = shift;
+  $self->session(expires => 1);
+  $self->flash_add_to( messages => 'You are logged out.' );
+  $self->redirect_to('/');
+};
+
+
+get '/add' => sub {
+  shift->stash( form => TLDR::Form::Add->new );
+} => 'add';
+
+
+post '/add' => sub {
+  my $self = shift;
+
+  my $form = TLDR::Form::Add->new;
+  $form->process( $self->params->to_hash );
+
+  if ( $form->validated ) {
+    my $url = $self->param('url');
+    my $title = $self->param('title');
+
+    my $story_id = $self->app->m->url_exists($url);
+
+    if ( $story_id ) {
+      $self->flash_add_to( messages => 'This story already added. You have been redirected to it.' );
+    }
+    else {
+      $story_id = $self->app->m->add_story({
+        votes    => 1,
+        url      => $url,
+        title    => $title,
+        username => $self->session('username'),
+        time     => time(),
+      });
+
+      # Optionaly push to twitter stream
+      if ($form->field('twitter')->value) {
+        my $url = $self->req->url->clone;
+        $url->path('/story/'. $story_id);
+        push @{ $self->session->{twitter_posts} }, $title .' '. $url->to_abs; 
+      }
+
+      $self->flash_add_to( messages => 'Successfully added post!' );
+    }
+
+    $self->redirect_to('/story/'. $story_id);
+  }
+
+  $self->stash( form => $form );
+  $self->render('add');
+};
+
+
+get '/story/:story_id/vote/:dir' => sub {
+  my $self = shift;
+  my $story_id = $self->param('story_id');
+  my $vote = ($self->param('dir') eq 'up') ? 1 : -1;
+
+  if ($self->stash->{user}->{votes}->{$story_id}) {
+    $self->flash_add_to( messages => 'You already voted for this story.' );
+    $self->redirect_to('/story/'. $story_id);
+    return;
+  }
+
+  $self->stash->{user}->{votes}->{$story_id} = $vote;
+
+  my $story = $self->app->m->story($story_id);
+  $self->render_not_found unless $story;
+
+  $story->{votes} += $vote;
+  $self->app->m->client->zincrby( top => 30 * 60 * 60, $story_id );
+
+  # Also give some karma to original poster
+  my $orig_poster = $self->app->m->get_user( $story->{username} );
+  $orig_poster->{karma}++;
+
+  $self->flash_add_to( messages => 'Successfully voted.' );
+  $self->redirect_to('/story/'. $story_id);
+};
+
+post '/story/:story_id/tldr' => sub {
+  my $self = shift;
+  my $form = TLDR::Form::AddTLDR->new;
+
+  my $story_id = $self->param('story_id');
+  my $story = $self->app->m->story($story_id);
+  $self->render_not_found unless $story;
+  $self->stash( story => $story );
+
+  $form->process( $self->params->to_hash );
+
+  if ($form->validated) {
+
+    my $tldr = {
+      title => escape_html($form->field('tldr')->value),
+      username => $self->session('username'),
+      votes => 1,
+      time => time(),
+    };
+
+    my $tldr_id = push $story->{tldr}, $tldr;
+
+    $self->app->m->get_user( $tldr->{username} )->{tldr_votes}->{$story_id}->{$tldr_id - 1} = 1;
+
+    # Optionaly push to twitter stream
+    if ($form->field('twitter')->value) {
+      my $url = $self->req->url->clone;
+      $url->path('/story/'. $story_id);
+      my $msg = '#tldr '. substr($form->field('tldr')->value, 0, 110) .' '. $url->to_abs .'#tldr'. ($tldr_id - 1);
+      push @{ $self->session->{twitter_posts} }, $msg; 
+    }
+
+    $self->flash_add_to( messages => 'your TL;DR; added' );
+    $self->redirect_to( '/story/'. $story_id );
+
+  }
+
+  $self->stash( add_tldr => $form );
+} => 'story';
+
+get '/story/:story_id/tldr/:tldr_id/vote/:dir' => sub {
+  my $self = shift;
+  my $story_id = $self->param('story_id');
+  my $tldr_id = $self->param('tldr_id');
+  my $vote = ($self->param('dir') eq 'up') ? 1 : -1;
+  my $user = $self->app->m->get_user( $self->session('username') );
+
+  if ($user->{tldr_votes}->{$story_id}->{$tldr_id}) {
+    $self->flash_add_to( messages => 'You already voted.' );
+    $self->redirect_to( '/story/'. $story_id );
+    return;
+  }
+
+  # Keep track of user's votes
+  $user->{tldr_votes}->{$story_id}->{$tldr_id} = $vote;
+
+  # Recalculate tldrs in story
+  my $story = $self->app->m->story_tldr_recalc($story_id, $tldr_id, $vote);
+  my $tldr = $story->{tldr}->[$tldr_id];
+
+  # Also give some karma to original poster
+  my $orig_poster = $self->app->m->get_user( $tldr->{username} );
+  $orig_poster->{karma}++;
+
+  $self->redirect_to( '/story/'. $story_id );
+};
+
+
+under '/admin' => sub {
+  my $self = shift;
+  return unless $self->session('username');
+  return $self->app->m->get_user( $self->session('username') )->{admin};
+};
+
+
+get '/invites' => sub {
+  my $self = shift;
+  $self->stash(
+    invites => $self->app->m->invites,
+    form => TLDR::Form::Admin::AddInvite->new({ action => '/admin/invites/add' }),
+  );
+} => 'admin/invites';
+
+post '/invites/add' => sub {
+  my $self = shift;
+  my $form = new TLDR::Form::Admin::AddInvite->new;
+  $form->process( $self->params->to_hash );
+
+  if ($form->validated) {
+    $self->app->m->invites->{ $form->field('code')->value } = {};
+    $self->flash_add_to( messages => 'Code added.' );
+    $self->redirect_to( '/admin/invites' );
+    return;
+  }
+
+  $self->stash(
+    invites => $self->app->m->invites,
+    form => $form,
+  );
+} => 'admin/invites';
+
+get '/invites/delete/*code' => sub {
+  my $self = shift;
+  delete $self->app->m->invites->{ $self->param('code') };
+  $self->flash_add_to( messages => 'Code deleted' );
+  $self->redirect_to('/admin/invites');
+};
+
+any '/redmon/*url' => { url => '' } => sub { 
+  my $self = shift;
+  my $method = lc $self->req->method;
+  my $url = 'http://127.0.0.1:4567/'. $self->param('url');
+  my $tx = $self->app->ua->$method($url => $self->params->to_hash);
+  $self->res->headers->header( 'Content-Type' => $tx->res->headers->header('Content-Type') );
+  $self->render_text($tx->res->body); 
+};
+
+
+app->start;
+__DATA__
+
+
+@@ newspost.html.ep
+<div class="row">
+  <section class="story-details-full span12">
+    <div class="votes news-vote-controls">
+      % if ( !session('username') || !session('user')->{votes}->{$story->{id}} ) {
+        <a href="/story/<%= $story->{id} %>/vote/up" alt="Vote Up" class="up"><i class="icon-thumbs-up"></i></a><br />
+        <a href="/story/<%= $story->{id} %>/vote/down" alt="Vote Down" class="down"><i class="icon-thumbs-down"></i></a>
+      % } else {
+        % if (session('user') && session('user')->{votes}->{$story->{id}} > 0) {
+          <span class='vote-yay'><i class="icon-thumbs-up"></i></span>
+        % } else {
+          <span class='vote-nay'><i class="icon-thumbs-down"></i></span>
+        % }
+      % }
+    </div>
+
+    <div class="story-info">
+      <div>
+        <p class="story-link">
+          <a href="<%= $story->{url} %>"><%= $story->{title} %></a>
+          <span class="story-domain">(<%= domain $story->{url} %>)</span>
+        </p>
+        % if ($story->{top_tldr} > -1) {
+          <div class="story-tldr">
+            <span><%== md $story->{tldr}->[ $story->{top_tldr} ]->{title} %></span>
+          </div> 
+        % }
+      </div>
+      <div class="story-details">
+        <span class="votes-count"><%= $story->{votes} %></span> vote(s), 
+        <span class="posted-by-username">by <a href="/user/<%= $story->{username} %>"><%= $story->{username} %></a>,</span> 
+        <span class="posted-date"><%= timeago $story->{time} %> ago.</span>
+        <span class="posted-details"><a href="/story/<%= $story->{id} %>">Story details</a>.</span>
+      </div>
+    </div>
+  </section>
+</div>
+
+
+@@ why.html.ep 
+% layout 'default';
+% title 'Why?';
+
+<div class="row"><div class="span12">
+<p>This project was created after spending too much time on <a href="http://news.ycombinator.com">Hacker News</a> 
+  and reading articles with headlines like "Is Dailybooth, THE original Web photo sharing service, closing down?".
+  This type of titles specificly crafted by editors to catch attention of reader. But quite often answer to question
+  in title can be just few words. In worst situation you need couple sentenses. So here we are - this site allow you
+  not just add news you care about, but also submit your <a href="http://en.wiktionary.org/wiki/TL;DR"><strong>tl;dr</strong></a>.
+</p><p>
+  <strong>tl;dr</strong> with most votes will replace original article title and allow you to quickly scan home page 
+  to be on top of today's news.
+</p>
+<p>This is toy project at this point, so I do expect bugs. Email anytime at 
+<a href="mailto:pavelkaroukin@gmail.com">pavelkaroukin@gmail.com</a> if you spot something.</p>
+</div></div>
+
+@@ generic_form.html.ep
+% layout 'default';
+% title $title;
+
+<%== $form->render %>
+
+
+@@ request/email.html.ep
+% layout 'default';
+% title 'Request Invite';
+
+<div class="row"><div class="span4">
+<%== $form->render %>
+</div></div>
+
+
+@@ register/hn.html.ep
+% layout 'default';
+% title 'Register via Hacker News';
+
+<div class="row">
+
+  <div class="span<%= (stash 'register_form') ? 7 : 4 %>">
+    <%== $form->render %>
+  </div>
+
+  % if (stash 'code') {
+  <div class="offset1 span4">
+    <p style="margin-top: 4em;">We generated code for you to put on your profile page on HN. Just put it somewhere in "About" field so we could check if you really
+    own this account.</p>
+    <p style="text-align: center;"><strong><%= $code %></strong></p>
+    <p>This code should appear on <a href="http://news.ycombinator.com/user?id=<%= param 'hnuser' %>">your profile page</a>.</p>
+  </div>
+  % }
+
+</div>
+
+
+@@ register/invite.html.ep
+% layout 'default';
+% title 'Register via Invitation Code';
+
+<div class="row">
+
+  <div class="span12">
+    <%== $form->render %>
+  </div>
+
+</div>
+
+
+@@ index.html.ep
+% layout 'default';
+% title 'Top Stories';
+
+% foreach my $item (@$items) {
+  %= include 'newspost', story => $item, user => stash('user')
+% }
+
+
+@@ new.html.ep
+% layout 'default';
+% title 'New Stories';
+
+% foreach my $item (@$items) {
+  %= include 'newspost', story => $item, user => stash('user')
+% }
+
+
+@@ registery.html.ep
+% layout 'default';
+% title 'Register';
+
+<div class="row">
+  <div class="span12">
+    <%== $form->render %>
+  </div>
+</div>
+
+
+@@ login.html.ep
+% layout 'default';
+% title 'Login';
+
+<div class="row">
+  <div class="span6 offset3">
+    <%== $form->render %>
+    <p style="text-align: center;"><a href="/register">Register</a> - <a href="/forgot">Forgot Password</a></p>
+  </div>
+</div>
+
+
+@@ add.html.ep
+% layout 'default';
+% title 'Add Story';
+
+<div class="row">
+  <div class="span12 add-post">
+    <%== $form->render %>
+  </div>
+</div>
+
+@@ story.html.ep
+% layout 'default';
+% title $story->{title};
+
+%= include 'newspost', story => $story
+
+% if (stash 'add_tldr') {
+<div class="row add-tldr-form">
+  <div class="span12">
+    <%== stash('add_tldr')->render %>
+  </div>
+</div>
+% }
+
+% for my $i ( 0 .. $#{ $story->{tldr} } ) {
+% my $tldr = $story->{tldr}->[$i];
+<div id="tldr<%= $i %>" class="row story-tldr<%= ($story->{top_tldr} == $i) ? ' story-tldr-top' : '' %>">
+
+  <div class="span12">
+    <div class="votes tld-vote-controls">
+      % if (!session('user') || !session('user')->{tldr_votes}->{$story->{id}}->{$i}) {
+        <a href="/story/<%= $story->{id} %>/tldr/<%= $i %>/vote/up" alt="Vote Up"><i class="icon-thumbs-up"></i></a><br>
+        <a href="/story/<%= $story->{id} %>/tldr/<%= $i %>/vote/down" alt="Vote Down"><i class="icon-thumbs-down"></i></a>
+      % } else {
+        % if (session('user') && session('user')->{tldr_votes}->{$story->{id}}->{$i} > 0) {
+          <span class='vote-yay'><i class="icon-thumbs-up"></i></span>
+        % } else {
+          <span class='vote-nay'><i class="icon-thumbs-down"></i></span>
+        % }
+      % }
+    </div>
+
+    <div class="story-tldr-inner">
+      <div class="tldr-content"><div><%== md $tldr->{title} %></div></div>
+
+      <div class="tldr-details">
+        <span class="votes-count"><%= $tldr->{votes} %> votes, 
+        by <span class="posted-by-username"><a href="/user/<%= $tldr->{username} %>"><%= $tldr->{username} %></a></span>, 
+        <span class="posted-date"><%= timeago $tldr->{time} %></span>
+      </div>
+    </div>
+  </div>
+</div>
+% }
+
+
+@@ admin/invites.html.ep
+% layout 'default';
+% title 'Admin: Invite codes';
+
+
+<div class="row">
+  <div class="span12">
+  % if (keys %${invites} > 0) {
+    <table class="table table-striped table-bordered table-hover table-condensed">
+      <tr><th>Code</th><th>Used by</th><th>Delete</th></tr>
+      % foreach my $key ( keys %${invites} ) {
+        <tr<%= ($invites->{$key}->{email}) ? " class=success" : '' %>>
+          <td><%= $key %></td>
+          <td><%= $invites->{$key}->{email} %></td>
+          <td><a href="/admin/invites/delete/<%= $key %>" />Delete</a></td>
+        </tr>
+      % }
+    </table>
+  % } else {
+    <p>No invite codes added yet.</p>
+  % }
+  </div>
+</div>
+
+<%== $form->render %>
+
+
+@@ register.html.ep
+% layout 'default';
+% title 'Register';
+
+<div class="row">
+  <div class="span12">
+    <p>We just started this project and currently offering invite-only registration.</p>
+    <p>Users who have account with Hacker News or Reddit and their karma &gt; 100 are auto-invited. HN users
+    just need to go through account verification by posting random code on their profile to verify account ownership
+    (this code can be removed after verification finished.)</p>
+    <p>Please proceed by selecting way you want to register with website.</p>
+  </div>
+</div>
+
+<div class="row registration-section">
+  <div class="offset2 span4" style="padding-right: 2em; border-right: 1px solid #CCC;">
+    <%== $byinvite->render %>
+    <h4><a href="/register/invite">I already have Invite Code</a></h4>
+  </div>
+  <div class="span4">
+    <%== $byhn->render %>
+  </div>
+</div>
+
+
+@@ user.html.ep
+% layout 'default';
+% title 'User: '. $user->{username};
+
+<div class="row">
+  <div class="span8">
+    <dl>
+      <dt>Username: </dt><dd><%= $user->{username} %></dd>
+      <dt>Karma: </dt><dd><%= $user->{karma} || 0 %></dd>
+      <dt>About: </dt><dd><%= $user->{about} || 'nothing here yet' %></dd>
+    </dl>
+  </div>
+  <div class="span4">
+    <ul>
+
+      % if ((session('username') eq $user->{username}) || (session('user') && session('user')->{admin})) {
+      <li><a href='/user/<%= $user->{username} %>/edit'>Edit</a></li>
+      % }
+
+      % if (session('user') && session('user')->{admin}) {
+      <li><a href='/admin/loginas/<%= $user->{username} %>'>Login As</a></li>
+      % }
+
+    </ul>
+  </div>
+</div>
+
+@@ user/edit.html.ep
+% layout 'default';
+% title 'Edit user: '. stash('user')->{username};
+
+<div class="row"><div class="span12">
+<%== $form->render %>
+</div></div>
+
+@@ layouts/default.html.ep
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <title><%= title %></title>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="description" content="">
+    <meta name="author" content="">
+
+    <!-- Le styles -->
+    <style>
+      body {
+        padding-top: 80px;
+      }
+    </style>
+    <link href="/css/bootstrap.min.css" rel="stylesheet">
+    <link rel="stylesheet" href="/css/font-awesome.css">
+    <link href='http://fonts.googleapis.com/css?family=Bad+Script' rel='stylesheet' type='text/css'>
+    <link href='http://fonts.googleapis.com/css?family=Quando' rel='stylesheet' type='text/css'>
+    <link href="/css/tldrer.css" rel="stylesheet">
+
+    <!-- Le HTML5 shim, for IE6-8 support of HTML5 elements -->
+    <!--[if lt IE 9]>
+      <script src="http://html5shim.googlecode.com/svn/trunk/html5.js"></script>
+    <![endif]-->
+
+  </head>
+
+  <body>
+
+    <nav class="navbar navbar-inverse navbar-fixed-top">
+      <div class="navbar-inner">
+        <div class="container">
+          <button type="button" class="btn btn-navbar" data-toggle="collapse" data-target=".nav-collapse">
+            <span class="icon-bar"></span>
+            <span class="icon-bar"></span>
+            <span class="icon-bar"></span>
+          </button>
+          <a class="brand" href="/">goTLDR &ndash; better headlines</a>
+          <div class="nav-collapse collapse">
+            <ul class="nav">
+              <li><a href="/">Top</a></li>
+              <li><a href="/new">New</a></li>
+              <li><a href="/add">Submit</a></li>
+              % if (! session('username')) {
+              <li><a href="/register">Register</a></li>
+              % }
+              <li><a href="/why">Why?</a></li>
+            </ul>
+
+            % if (session('username')) {
+            <ul class="nav pull-right">
+              <li><a href="/user/<%= session('username') %>">Hello, <%= session('username') %>!</a></li>
+              <li><a href="/logout">Logout</a></li>
+            </ul>
+            % } else {
+            <form class="navbar-form pull-right" action="/login?redirect_to=<%= $self->req->url->path %>" method="POST">
+              <input class="span2" type="text" placeholder="Email" name="username">
+              <input class="span2" type="password" placeholder="Password" name="password">
+              <button type="submit" class="btn">Sign in</button>
+            </form>
+            % }
+
+          </div><!--/.nav-collapse -->
+        </div>
+      </div>
+    </nav>
+
+    % if (flash 'messages') {
+    <div class="container">
+      <div class="row">
+        <ul class="span12 messages alert alert-info">
+          % foreach my $message ( @{ flash 'messages' } ) {
+            <li><%== $message %></li>
+          % }
+        </ul>
+      </div>
+    </div>
+    % }
+
+    <section class="container">
+      <%= content %>
+    </section>
+
+    <footer class="footer">
+      <div class="container">
+        <p class="pull-right"><a href="#">Back to top</a></p>
+        <p>Built with <a href="http://twitter.github.com/bootstrap/">Twitter Bootstrap</a> and <a href="http://mojolicio.us/">Mojolicious</a> by <a href="http://pavel.karoukin.us">Pavel A. Karoukin</a>.</p>
+        <p style="text-align: center"><script type="text/javascript" src="https://apis.google.com/js/plusone.js"></script><g:plusone></g:plusone></p>
+      </div>
+    </footer>
+
+  </body>
+
+  <!-- Le scripts -->
+  <script src="//ajax.googleapis.com/ajax/libs/jquery/1.8.2/jquery.min.js"></script>
+  <script src="/js/bootstrap.min.js"></script>
+  <script src="/js/tldrer.js"></script>
+  <script type="text/javascript">
+
+    var _gaq = _gaq || [];
+    _gaq.push(['_setAccount', 'UA-36255235-1']);
+    _gaq.push(['_setDomainName', 'gotldr.com']);
+    _gaq.push(['_setAllowLinker', true]);
+    _gaq.push(['_trackPageview']);
+
+    (function() {
+      var ga = document.createElement('script'); ga.type = 'text/javascript'; ga.async = true;
+      ga.src = ('https:' == document.location.protocol ? 'https://ssl' : 'http://www') + '.google-analytics.com/ga.js';
+      var s = document.getElementsByTagName('script')[0]; s.parentNode.insertBefore(ga, s);
+    })();
+
+  </script>
+  <script type="text/javascript">
+    var uvOptions = {};
+    (function() {
+      var uv = document.createElement('script'); uv.type = 'text/javascript'; uv.async = true;
+      uv.src = ('https:' == document.location.protocol ? 'https://' : 'http://') + 'widget.uservoice.com/m0akLNf9bw3BXygXfRNXoA.js';
+      var s = document.getElementsByTagName('script')[0]; s.parentNode.insertBefore(uv, s);
+    })();
+  </script>
+</html>
+
